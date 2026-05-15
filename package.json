@@ -8,7 +8,7 @@
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
   },
   "keywords": [],
-  "author": "Jonas Sota",
+  "author": "Thinking Machines",
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^16.18.0",

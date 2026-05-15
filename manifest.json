@@ -1,10 +1,10 @@
 {
   "id": "obsidian-plugin-file-view",
-  "name": "Interleaved File Explorer Sort",
+  "name": "Thinking Machines File Explorer",
   "version": "0.1.0",
   "minAppVersion": "1.12.0",
   "description": "Sorts files and folders in one merged list in the File Explorer, so Johnny Decimal IDs display in true numeric order.",
-  "author": "Jonas Sota",
+  "author": "Thinking Machines",
   "authorUrl": "https://github.com/thinking-machines-group",
   "isDesktopOnly": false
 }

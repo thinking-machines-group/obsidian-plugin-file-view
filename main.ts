@@ -1,4 +1,4 @@
-import { Plugin, TAbstractFile, TFile, TFolder, View, WorkspaceLeaf } from "obsidian";
+import { Notice, Plugin, TAbstractFile, TFile, View, WorkspaceLeaf } from "obsidian";
 
 type SortOrder =
   | "alphabetical"
@@ -11,56 +11,75 @@ type SortOrder =
 interface FileTreeItem {
   file: TAbstractFile;
   children?: FileTreeItem[];
-  vChildren?: { setChildren?: (items: FileTreeItem[]) => void; _children?: FileTreeItem[] };
+  vChildren?: {
+    setChildren?: (items: FileTreeItem[]) => void;
+    _children?: FileTreeItem[];
+    children?: FileTreeItem[];
+  };
   sort?: (...args: unknown[]) => unknown;
 }
 
 interface FileExplorerView extends View {
-  sortOrder: SortOrder;
-  fileItems: Record<string, FileTreeItem>;
+  sortOrder?: SortOrder;
+  fileItems?: Record<string, FileTreeItem>;
   requestSort?: () => void;
   sort?: () => void;
 }
 
-const LOG = "[interleaved-sort]";
+const LOG = "[tm-file-explorer]";
 
 function sortKey(file: TAbstractFile): string {
   return (file instanceof TFile ? file.basename : file.name).toLowerCase();
 }
 
-function getMtime(item: FileTreeItem): number {
+function mtime(item: FileTreeItem): number {
   const f = item.file;
   return f instanceof TFile ? f.stat.mtime : 0;
 }
 
-function getCtime(item: FileTreeItem): number {
+function ctime(item: FileTreeItem): number {
   const f = item.file;
   return f instanceof TFile ? f.stat.ctime : 0;
 }
 
 function compareItems(order: SortOrder, a: FileTreeItem, b: FileTreeItem): number {
   switch (order) {
-    case "alphabetical":
-      return sortKey(a.file).localeCompare(sortKey(b.file), undefined, { numeric: true });
     case "alphabeticalReverse":
       return sortKey(b.file).localeCompare(sortKey(a.file), undefined, { numeric: true });
     case "byModifiedTime":
-      return getMtime(b) - getMtime(a);
+      return mtime(b) - mtime(a);
     case "byModifiedTimeReverse":
-      return getMtime(a) - getMtime(b);
+      return mtime(a) - mtime(b);
     case "byCreatedTime":
-      return getCtime(b) - getCtime(a);
+      return ctime(b) - ctime(a);
     case "byCreatedTimeReverse":
-      return getCtime(a) - getCtime(b);
+      return ctime(a) - ctime(b);
+    case "alphabetical":
     default:
       return sortKey(a.file).localeCompare(sortKey(b.file), undefined, { numeric: true });
   }
 }
 
-export default class InterleavedSortPlugin extends Plugin {
+export default class TMFileExplorerPlugin extends Plugin {
   private restorers: Array<() => void> = [];
+  private patchStatus = "not attempted";
 
   async onload() {
+    this.addCommand({
+      id: "diagnose",
+      name: "Diagnose File Explorer internals",
+      callback: () => this.diagnose(),
+    });
+    this.addCommand({
+      id: "reapply",
+      name: "Re-apply sort patch",
+      callback: () => {
+        this.unpatch();
+        this.tryPatch();
+        new Notice(`${LOG} ${this.patchStatus}`);
+      },
+    });
+
     this.app.workspace.onLayoutReady(() => this.tryPatch());
     this.registerEvent(
       this.app.workspace.on("layout-change", () => {
@@ -70,6 +89,23 @@ export default class InterleavedSortPlugin extends Plugin {
   }
 
   onunload() {
+    this.unpatch();
+    this.requestResort();
+  }
+
+  private getView(): FileExplorerView | null {
+    const leaf: WorkspaceLeaf | undefined = this.app.workspace.getLeavesOfType("file-explorer")[0];
+    return (leaf?.view as unknown as FileExplorerView) ?? null;
+  }
+
+  private requestResort() {
+    const view = this.getView();
+    if (!view) return;
+    if (typeof view.requestSort === "function") view.requestSort();
+    else if (typeof view.sort === "function") view.sort();
+  }
+
+  private unpatch() {
     while (this.restorers.length > 0) {
       try {
         this.restorers.pop()!();
@@ -77,68 +113,136 @@ export default class InterleavedSortPlugin extends Plugin {
         console.error(LOG, "restore failed", err);
       }
     }
-    this.requestExplorerResort();
-  }
-
-  private getExplorerLeaf(): WorkspaceLeaf | null {
-    return this.app.workspace.getLeavesOfType("file-explorer")[0] ?? null;
-  }
-
-  private getExplorerView(): FileExplorerView | null {
-    const leaf = this.getExplorerLeaf();
-    return (leaf?.view as unknown as FileExplorerView) ?? null;
-  }
-
-  private requestExplorerResort() {
-    const view = this.getExplorerView();
-    if (!view) return;
-    if (typeof view.requestSort === "function") view.requestSort();
-    else if (typeof view.sort === "function") view.sort();
+    this.patchStatus = "unpatched";
   }
 
   private tryPatch() {
     if (this.restorers.length > 0) return;
-    const view = this.getExplorerView();
+    const view = this.getView();
     if (!view) {
-      console.warn(LOG, "no file-explorer view present yet");
+      this.patchStatus = "no file-explorer view";
+      console.warn(LOG, this.patchStatus);
       return;
     }
 
+    // Strategy 1: patch FolderTreeItem.prototype.sort
     const rootItem = view.fileItems?.["/"];
-    if (!rootItem) {
-      console.warn(LOG, "fileItems['/'] not found", Object.keys(view.fileItems ?? {}));
-      return;
-    }
-
-    const folderProto = Object.getPrototypeOf(rootItem) as FileTreeItem;
-    const originalSort = folderProto.sort;
-    if (typeof originalSort !== "function") {
-      console.warn(LOG, "folder prototype has no sort()", Object.getOwnPropertyNames(folderProto));
-      return;
-    }
-
-    folderProto.sort = function patchedSort(this: FileTreeItem) {
-      const order = view.sortOrder ?? "alphabetical";
-
-      const rawChildren = (this as unknown as { children?: FileTreeItem[] }).children;
-      if (!Array.isArray(rawChildren) || !this.vChildren) {
-        return (originalSort as (...a: unknown[]) => unknown).apply(this, arguments as unknown as unknown[]);
+    if (rootItem) {
+      const proto = Object.getPrototypeOf(rootItem) as FileTreeItem;
+      if (typeof proto.sort === "function") {
+        this.patchFolderSort(proto, view);
+        return;
       }
+    }
 
-      const merged = rawChildren.slice().sort((a, b) => compareItems(order, a, b));
+    // Strategy 2: patch FileExplorerView.prototype methods commonly used to produce sorted children
+    const viewProto = Object.getPrototypeOf(view) as Record<string, unknown>;
+    const candidateNames = ["getSortedFolderItems", "getSortedFileItems", "sortItems", "sort"];
+    for (const name of candidateNames) {
+      if (typeof viewProto[name] === "function") {
+        this.patchViewMethod(viewProto, name, view);
+        return;
+      }
+    }
 
+    this.patchStatus = "no sort surface found (run Diagnose command)";
+    console.warn(LOG, this.patchStatus, {
+      viewKeys: Object.getOwnPropertyNames(viewProto),
+      rootKeys: rootItem ? Object.getOwnPropertyNames(Object.getPrototypeOf(rootItem)) : null,
+    });
+  }
+
+  private patchFolderSort(proto: FileTreeItem, view: FileExplorerView) {
+    const original = proto.sort!;
+    const childrenProp = this.detectChildrenProp(view.fileItems);
+    proto.sort = function patchedSort(this: FileTreeItem) {
+      const order = view.sortOrder ?? "alphabetical";
+      const rawAny = this as unknown as Record<string, unknown>;
+      const raw = (childrenProp ? rawAny[childrenProp] : rawAny.children) as FileTreeItem[] | undefined;
+      if (!Array.isArray(raw) || !this.vChildren) {
+        return (original as (...a: unknown[]) => unknown).apply(this, arguments as unknown as unknown[]);
+      }
+      const merged = raw.slice().sort((a, b) => compareItems(order, a, b));
       if (typeof this.vChildren.setChildren === "function") {
         this.vChildren.setChildren(merged);
-      } else {
+      } else if (this.vChildren._children) {
         this.vChildren._children = merged;
+      } else {
+        this.vChildren.children = merged;
       }
     };
-
     this.restorers.push(() => {
-      folderProto.sort = originalSort;
+      proto.sort = original;
     });
+    this.patchStatus = `patched FolderTreeItem.sort (children prop: ${childrenProp ?? "children"})`;
+    console.info(LOG, this.patchStatus);
+    this.requestResort();
+  }
 
-    this.requestExplorerResort();
-    console.info(LOG, "patched FolderTreeItem.sort; sortOrder=", view.sortOrder);
+  private patchViewMethod(viewProto: Record<string, unknown>, name: string, view: FileExplorerView) {
+    const original = viewProto[name] as (...args: unknown[]) => unknown;
+    const plugin = this;
+    viewProto[name] = function patched(this: unknown, ...args: unknown[]) {
+      const result = original.apply(this, args);
+      if (Array.isArray(result) && result.length > 0 && (result[0] as FileTreeItem).file) {
+        const order = view.sortOrder ?? "alphabetical";
+        return result.slice().sort((a, b) => compareItems(order, a as FileTreeItem, b as FileTreeItem));
+      }
+      return result;
+    } as unknown;
+    this.restorers.push(() => {
+      viewProto[name] = original;
+    });
+    this.patchStatus = `patched view.${name}`;
+    console.info(LOG, this.patchStatus);
+    this.requestResort();
+    void plugin;
+  }
+
+  private detectChildrenProp(fileItems: Record<string, FileTreeItem> | undefined): string | null {
+    if (!fileItems) return null;
+    for (const item of Object.values(fileItems)) {
+      const anyItem = item as unknown as Record<string, unknown>;
+      for (const k of ["children", "tChildren", "_children"]) {
+        const v = anyItem[k];
+        if (Array.isArray(v) && v.length > 0 && (v[0] as FileTreeItem).file) return k;
+      }
+    }
+    return null;
+  }
+
+  private diagnose() {
+    const view = this.getView();
+    const lines: string[] = [];
+    lines.push(`status: ${this.patchStatus}`);
+    if (!view) {
+      lines.push("no file-explorer view");
+    } else {
+      const viewProto = Object.getPrototypeOf(view) as object;
+      lines.push(`view prototype: ${Object.getOwnPropertyNames(viewProto).join(", ")}`);
+      const root = view.fileItems?.["/"];
+      if (root) {
+        const rootProto = Object.getPrototypeOf(root) as object;
+        lines.push(`root item prototype: ${Object.getOwnPropertyNames(rootProto).join(", ")}`);
+        lines.push(`root item own keys: ${Object.keys(root).join(", ")}`);
+        const childrenProp = this.detectChildrenProp(view.fileItems);
+        lines.push(`detected children prop: ${childrenProp ?? "none"}`);
+        if (childrenProp) {
+          const c = (root as unknown as Record<string, FileTreeItem[]>)[childrenProp];
+          lines.push(`root.${childrenProp} length: ${c?.length ?? "n/a"}`);
+        }
+        lines.push(`vChildren keys: ${root.vChildren ? Object.keys(root.vChildren).join(", ") : "n/a"}`);
+      } else {
+        lines.push("no root file item");
+      }
+      lines.push(`sortOrder: ${view.sortOrder}`);
+    }
+    const out = lines.join("\n");
+    console.group(LOG + " diagnose");
+    console.log(out);
+    console.log("view:", view);
+    console.log("root:", view?.fileItems?.["/"]);
+    console.groupEnd();
+    new Notice(out, 15000);
   }
 }

@@ -1,4 +1,4 @@
-# Interleaved File Explorer Sort
+# Thinking Machines File Explorer
 
 Obsidian plugin that interleaves files and directories in the File Explorer sort order so identifiers like Johnny Decimal IDs display in true numeric sequence.
 
